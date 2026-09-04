@@ -61,7 +61,7 @@ namespace ChipDataInterface
         public void SetValue(bool value)
         {
             BitValue = value;
-            Text = value ? "1" : "0";
+            Text = value ? "1" : "0";  
         }
 
         protected override void OnClick(EventArgs e)

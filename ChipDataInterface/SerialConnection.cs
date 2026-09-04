@@ -1,42 +1,55 @@
 ﻿using System;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Ports;
+using System.Threading;
 
 namespace ChipDataInterface
 {
     /// <summary>
-    /// Bir COM port üzerinden UART bağlantısının açılmasını,
-    /// RAW byte gönderilip alınmasını ve bağlantının güvenli
-    /// şekilde kapatılmasını yönetir.
+    /// Bir sanal COM portu üzerinden FTDI/TTL-UART haberleşmesini yönetir.
+    ///
+    /// Bu sınıf yalnızca UART taşıma katmanından sorumludur. Veriyi metne
+    /// dönüştürmez, byte veya bit sırasını değiştirmez ve EEPROM komutu gibi
+    /// cihaza özel bir protokol uygulamaz.
     /// </summary>
     internal sealed class SerialConnection : IDisposable
     {
-        // Buradaki 8, arayüzde gösterilen payload uzunluğu değildir.
-        // UART'ın 8N1 iletişim biçimindeki veri biti sayısıdır.
+        // Projenin sabit UART çerçevesi 8N1'dir:
+        // 1 başlangıç biti, 8 veri biti, eşlik biti yok ve 1 dur biti.
         private const int UartDataBits = 8;
+        private const int UartFrameBitCount = 10;
 
-        private const int TimeoutMilliseconds = 1000;
+        private const int IoTimeoutMilliseconds = 1000;
+        private const int TransmitDrainPollMilliseconds = 1;
 
         private SerialPort? _serialPort;
+        private bool _isDisposed;
 
         public bool IsConnected =>
-            _serialPort?.IsOpen == true;
+            !_isDisposed && _serialPort?.IsOpen == true;
 
         /// <summary>
-        /// UART üzerinden yeni bir byte alındığında tetiklenir.
-        /// Bu olay arka plan iş parçacığında çalışır.
+        /// UART'tan bir byte alındığında tetiklenir. SerialPort bu olayı
+        /// arka plan thread'inde oluşturduğu için arayüz kodu Invoke veya
+        /// BeginInvoke kullanarak UI thread'ine dönmelidir.
         /// </summary>
         public event Action<byte>? ByteReceived;
 
         /// <summary>
-        /// UART verisi okunurken hata oluştuğunda tetiklenir.
+        /// Aktif alım sırasında beklenen bir seri port hatası oluştuğunda
+        /// tetiklenir.
         /// </summary>
         public event Action<Exception>? ReceiveError;
 
-        public void Connect(
-            string portName,
-            int baudRate)
+        /// <summary>
+        /// Seçilen COM portunu 8N1 ve donanımsal/yazılımsal akış kontrolü
+        /// olmadan açar. Baud rate hedef cihazdaki değerle aynı olmalıdır.
+        /// </summary>
+        public void Connect(string portName, int baudRate)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(portName))
             {
                 throw new ArgumentException(
@@ -58,27 +71,29 @@ namespace ChipDataInterface
                     "Bir COM port bağlantısı zaten açık.");
             }
 
+            // Önceki denemeden kalmış kapalı SerialPort nesnesini temizler.
             Disconnect();
 
-            string normalizedPortName =
-                portName.Trim();
-
             SerialPort serialPort = new(
-                normalizedPortName,
+                portName.Trim(),
                 baudRate,
                 Parity.None,
                 UartDataBits,
                 StopBits.One)
             {
                 Handshake = Handshake.None,
-                ReadTimeout = TimeoutMilliseconds,
-                WriteTimeout = TimeoutMilliseconds,
+                ReadTimeout = IoTimeoutMilliseconds,
+                WriteTimeout = IoTimeoutMilliseconds,
                 ReceivedBytesThreshold = 1,
+
+                // Bu proje yalnızca TX, RX ve GND ile çalışır. DTR/RTS'nin
+                // bazı hedef kartlarda reset veya kontrol sinyali üretmesini
+                // önlemek için iki çıkış da devre dışıdır.
                 DtrEnable = false,
                 RtsEnable = false
             };
 
-            // Port açılmadan önce veri alma olayı bağlanır.
+            // Port açıldığı anda veri gelebileceğinden olay önce bağlanır.
             serialPort.DataReceived += SerialPort_DataReceived;
 
             try
@@ -95,11 +110,14 @@ namespace ChipDataInterface
         }
 
         /// <summary>
-        /// Verilen byte dizisini herhangi bir metin dönüşümü
-        /// uygulamadan RAW veri olarak UART'a yazar.
+        /// Verilen diziyi sırasını değiştirmeden RAW byte olarak gönderir.
+        /// Örneğin { A0, 00, 0F } dizisi hatta aynı byte sırasıyla çıkar.
+        /// UART içindeki başlangıç/dur bitlerini ve veri bitlerinin fiziksel
+        /// seri sırasını FT232RL donanımı otomatik olarak üretir.
         /// </summary>
         public void Send(byte[] data)
         {
+            ThrowIfDisposed();
             ArgumentNullException.ThrowIfNull(data);
 
             if (data.Length == 0)
@@ -109,22 +127,68 @@ namespace ChipDataInterface
                     nameof(data));
             }
 
-            if (_serialPort is null ||
-                !_serialPort.IsOpen)
-            {
-                throw new InvalidOperationException(
-                    "Veri göndermek için önce COM bağlantısı açılmalıdır.");
-            }
+            SerialPort serialPort =
+                GetOpenSerialPort();
 
-            _serialPort.Write(
+            // Byte[] overload'u kullanıldığı için kodlama, satır sonu veya
+            // ASCII dönüşümü uygulanmaz. offset=0 ile dizinin ilk byte'ı
+            // önce, ardından kalan byte'lar indeks sırasıyla yazılır.
+            serialPort.Write(
                 data,
                 offset: 0,
                 count: data.Length);
+
+            WaitForTransmitCompletion(
+                serialPort,
+                data.Length);
         }
 
         /// <summary>
-        /// SerialPort tarafından veri geldiği bildirildiğinde,
-        /// alınabilecek bütün byte'ları sırayla okur.
+        /// Bilgisayar ve sürücü gönderme tamponunun boşalmasını bekler.
+        /// Ardından FT232RL içindeki son verinin de UART hattından çıkabilmesi
+        /// için 8N1 ve seçilen baud rate üzerinden koruyucu süre hesaplar.
+        /// Böylece çağıran kod Send dönüşünde portu güvenle kapatabilir.
+        /// </summary>
+        private static void WaitForTransmitCompletion(
+            SerialPort serialPort,
+            int byteCount)
+        {
+            Stopwatch stopwatch =
+                Stopwatch.StartNew();
+
+            while (serialPort.BytesToWrite > 0)
+            {
+                if (stopwatch.ElapsedMilliseconds >=
+                    IoTimeoutMilliseconds)
+                {
+                    throw new TimeoutException(
+                        "UART gönderme tamponu zamanında boşalmadı.");
+                }
+
+                Thread.Sleep(
+                    TransmitDrainPollMilliseconds);
+            }
+
+            // 8N1'de her byte hatta toplam 10 bit olarak çıkar. Tamponun
+            // sıfırlanması sürücünün veriyi FTDI'ye teslim ettiğini gösterir;
+            // bu kısa ek bekleme, cihaz FIFO'sundaki son çerçeveyi de kapsar.
+            double transmissionMilliseconds =
+                byteCount * UartFrameBitCount * 1000.0 /
+                serialPort.BaudRate;
+
+            int guardDelayMilliseconds =
+                Math.Max(
+                    1,
+                    (int)Math.Ceiling(
+                        transmissionMilliseconds));
+
+            Thread.Sleep(guardDelayMilliseconds);
+        }
+
+        /// <summary>
+        /// DataReceived her byte için ayrı ayrı oluşmak zorunda değildir.
+        /// Bu nedenle olay geldiğinde alım tamponunda bulunan bütün byte'lar
+        /// FIFO/geliş sırasıyla okunur ve tek tek üst katmana iletilir.
         /// </summary>
         private void SerialPort_DataReceived(
             object sender,
@@ -158,21 +222,34 @@ namespace ChipDataInterface
                 UnauthorizedAccessException or
                 TimeoutException)
             {
-                ReceiveError?.Invoke(exception);
+                // Kullanıcının bilinçli Disconnect çağrısı sırasında oluşan
+                // kapanma hatasını yeni bir RX hatası olarak bildirmez.
+                if (ReferenceEquals(
+                    _serialPort,
+                    serialPort))
+                {
+                    ReceiveError?.Invoke(exception);
+                }
             }
         }
 
+        /// <summary>
+        /// Açık COM portunu kapatır, olay aboneliğini kaldırır ve Windows
+        /// kaynağını serbest bırakır. Birden fazla kez çağrılması güvenlidir.
+        /// </summary>
         public void Disconnect()
         {
-            if (_serialPort is null)
+            SerialPort? serialPort =
+                _serialPort;
+
+            // Diğer metotlar bağlantıyı hemen kapalı görsün ve bilinçli port
+            // kapanışı ReceiveError olarak raporlanmasın diye önce temizlenir.
+            _serialPort = null;
+
+            if (serialPort is null)
             {
                 return;
             }
-
-            // Alan önceden temizlenerek bağlantının artık açık
-            // olmadığı diğer metotlara hemen bildirilir.
-            SerialPort serialPort = _serialPort;
-            _serialPort = null;
 
             serialPort.DataReceived -= SerialPort_DataReceived;
 
@@ -189,9 +266,44 @@ namespace ChipDataInterface
             }
         }
 
+        private SerialPort GetOpenSerialPort()
+        {
+            if (_serialPort is null ||
+                !_serialPort.IsOpen)
+            {
+                throw new InvalidOperationException(
+                    "İşlem için önce COM bağlantısı açılmalıdır.");
+            }
+
+            return _serialPort;
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_isDisposed)
+            {
+                throw new ObjectDisposedException(
+                    nameof(SerialConnection));
+            }
+        }
+
         public void Dispose()
         {
-            Disconnect();
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            try
+            {
+                Disconnect();
+            }
+            finally
+            {
+                _isDisposed = true;
+            }
+
+            GC.SuppressFinalize(this);
         }
     }
 }

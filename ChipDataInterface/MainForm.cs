@@ -39,12 +39,25 @@ namespace ChipDataInterface
             57600
         };
 
+        // Uygulamanın desteklediği veri uzunluklarıdır.
+        // Her seçenek ekranda gösterilecek metni ve gerçek byte sayısını taşır.
+        private static readonly PayloadSizeOption[] SupportedPayloadSizes =
+        {
+            new PayloadSizeOption(
+                1,
+                "1 Byte (8 Bits)"),
+
+            new PayloadSizeOption(
+                8,
+                "8 Bytes (64 Bits)")
+        };
+
         #endregion
 
         #region Types
 
         /// <summary>
-        /// Günlük kayıtlarının türünü ve ekranda kullanılacak rengini belirler.
+        /// Günlük kayıtlarının türünü belirler.
         /// </summary>
         private enum LogEntryType
         {
@@ -65,12 +78,27 @@ namespace ChipDataInterface
         private readonly List<BitButton> _txBitButtons = new();
         private readonly List<BitButton> _rxBitButtons = new();
 
+        // Çoklu-byte modunda kullanılan TX ve RX HEX kutularıdır.
+        // Liste sırası aynı zamanda aktarım sırasıdır: listenin ilk elemanı
+        // ekrandaki en soldaki kutudur ve UART'a ilk yazılan/alınan byte'tır.
+        // Bu katmanda endian dönüşümü veya manuel bit tersleme yapılmaz.
+        private readonly List<HexByteTextBox> _txByteTextBoxes = new();
+        private readonly List<HexByteTextBox> _rxByteTextBoxes = new();
+
         // Read işlemi sırasında veri gelmezse bağlantıyı kapatır.
         private readonly System.Windows.Forms.Timer _readTimeoutTimer = new();
 
-        // Yalnızca aktif bir Read sırasında gelen ilk byte'ın
-        // RX alanında işlenmesini sağlar.
+        // Yalnızca aktif bir Read işlemi sırasında gelen byte'ların
+        // işlenmesini sağlar.
         private bool _isReadPending;
+
+        // Read başladığında seçilen payload uzunluğuna göre oluşturulur.
+        // Gelen byte'lar tamamlanana kadar burada sırasıyla biriktirilir.
+        private byte[] _receiveBuffer =
+            Array.Empty<byte>();
+
+        // Aktif Read sırasında tamponda kaç byte bulunduğunu tutar.
+        private int _receivedByteCount;
 
         #endregion
 
@@ -80,16 +108,18 @@ namespace ChipDataInterface
         {
             InitializeComponent();
 
-            CreateTxBitButtons();
-            CreateRxBitButtons();
+            InitializeConnectionOptions();
+            InitializePayloadSizeOptions();
             InitializeReadOperation();
             RegisterEventHandlers();
 
+            // Başlangıçta Payload Size seçilmediği için
+            // TX ve RX alanları boş bırakılır.
+            RebuildPayloadControls();
+
             WriteLog(
                 LogEntryType.Information,
-                "Application ready. Select COM port and baud rate.");
-
-            InitializeConnectionOptions();
+                "Application ready. Select COM port, baud rate and payload size.");
         }
 
         /// <summary>
@@ -108,6 +138,26 @@ namespace ChipDataInterface
             baudRateComboBox.SelectedIndex = -1;
 
             RefreshAvailablePorts();
+        }
+
+        private void InitializePayloadSizeOptions()
+        {
+            payloadSizeComboBox.Items.Clear();
+
+            // ComboBox'ta seçenek nesnesinin DisplayText özelliği gösterilir.
+            // Program işlemleri ekrandaki yazıya göre değil,
+            // seçeneğin ByteCount değerine göre yapacaktır.
+            payloadSizeComboBox.DisplayMember =
+                nameof(PayloadSizeOption.DisplayText);
+
+            foreach (PayloadSizeOption payloadSize in SupportedPayloadSizes)
+            {
+                payloadSizeComboBox.Items.Add(payloadSize);
+            }
+
+            // Yanlış veri uzunluğuyla kazara işlem yapılmasını engellemek için
+            // başlangıçta herhangi bir seçenek otomatik olarak seçilmez.
+            payloadSizeComboBox.SelectedIndex = -1;
         }
 
         /// <summary>
@@ -143,6 +193,18 @@ namespace ChipDataInterface
             baudRateComboBox.SelectedIndexChanged +=
                 ConnectionSettingChanged;
 
+            payloadSizeComboBox.SelectedIndexChanged +=
+                PayloadSizeComboBox_SelectedIndexChanged;
+
+            portComboBox.SelectionChangeCommitted +=
+                SelectionComboBox_SelectionChangeCommitted;
+
+            baudRateComboBox.SelectionChangeCommitted +=
+                SelectionComboBox_SelectionChangeCommitted;
+
+            payloadSizeComboBox.SelectionChangeCommitted +=
+                SelectionComboBox_SelectionChangeCommitted;
+
             _readTimeoutTimer.Tick +=
                 ReadTimeoutTimer_Tick;
 
@@ -153,19 +215,128 @@ namespace ChipDataInterface
                 SerialConnection_ReceiveError;
         }
 
+        /// <summary>
+        /// Kullanıcı seçimini tamamladıktan sonra ComboBox odağını kaldırır.
+        /// Seçilen değer korunur, yalnızca mavi seçim vurgusu kaybolur.
+        /// </summary>
+        private void SelectionComboBox_SelectionChangeCommitted(
+            object? sender,
+            EventArgs e)
+        {
+            PostToUiThread(
+                () => ActiveControl = null);
+        }
+
         #endregion
 
-        #region Bit Buttons
+        #region Payload Controls
 
         /// <summary>
-        /// Kullanıcı tarafından değiştirilebilen TX bitlerini oluşturur.
-        /// Bitler ekranda soldan sağa 7, 6, ..., 0 şeklinde gösterilir.
+        /// Kullanıcının seçtiği veri uzunluğunu döndürür.
+        /// Herhangi bir seçim yapılmamışsa null döner.
+        /// </summary>
+        private PayloadSizeOption? SelectedPayloadSize =>
+            payloadSizeComboBox.SelectedItem as PayloadSizeOption;
+
+        /// <summary>
+        /// TX ve RX panellerindeki eski kontrolleri kaldırır ve
+        /// kullandıkları Windows kaynaklarını serbest bırakır.
+        /// </summary>
+        private void ClearPayloadControls()
+        {
+            DisposeChildControls(txBitsPanel);
+            DisposeChildControls(rxBitsPanel);
+
+            _txBitButtons.Clear();
+            _rxBitButtons.Clear();
+
+            _txByteTextBoxes.Clear();
+            _rxByteTextBoxes.Clear();
+        }
+
+        private static void DisposeChildControls(
+            Control container)
+        {
+            // Controls.Clear() kontrolleri yalnızca panelden kaldırabilir.
+            // Dispose çağrısı, mod tekrar tekrar değiştirildiğinde
+            // kullanılmayan kontrollerin bellekte kalmasını engeller.
+            for (int index = container.Controls.Count - 1;
+                 index >= 0;
+                 index--)
+            {
+                Control childControl =
+                    container.Controls[index];
+
+                container.Controls.RemoveAt(index);
+                childControl.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Seçilen veri uzunluğuna uygun TX ve RX kontrollerini oluşturur.
+        /// </summary>
+        private void RebuildPayloadControls()
+        {
+            ClearPayloadControls();
+
+            PayloadSizeOption? payloadSize =
+                SelectedPayloadSize;
+
+            if (payloadSize is null)
+            {
+                SetCommunicationControlsEnabled(true);
+                return;
+            }
+
+            if (payloadSize.ByteCount == 1)
+            {
+                CreateTxBitButtons();
+                CreateRxBitButtons();
+            }
+            else
+            {
+                CreateTxByteTextBoxes(payloadSize.ByteCount);
+                CreateRxByteTextBoxes(payloadSize.ByteCount);
+            }
+
+            SetCommunicationControlsEnabled(true);
+        }
+
+        /// <summary>
+        /// Payload Size değiştiğinde eski bağlantıyı kapatır ve
+        /// TX/RX alanlarını yeni veri uzunluğuna göre oluşturur.
+        /// </summary>
+        private void PayloadSizeComboBox_SelectedIndexChanged(
+            object? sender,
+            EventArgs e)
+        {
+            if (_isReadPending)
+            {
+                EndReadOperation();
+            }
+            else
+            {
+                _serialConnection.Disconnect();
+            }
+
+            RebuildPayloadControls();
+
+            if (SelectedPayloadSize is PayloadSizeOption payloadSize)
+            {
+                WriteLog(
+                    LogEntryType.Information,
+                    $"Payload size selected: " +
+                    $"{payloadSize.ByteCount} byte " +
+                    $"({payloadSize.BitCount} bits).");
+            }
+        }
+
+        /// <summary>
+        /// 1-byte modunda kullanıcı tarafından değiştirilebilen
+        /// sekiz TX bit butonunu oluşturur.
         /// </summary>
         private void CreateTxBitButtons()
         {
-            txBitsPanel.Controls.Clear();
-            _txBitButtons.Clear();
-
             for (int bitIndex = PayloadBitCount - 1;
                  bitIndex >= 0;
                  bitIndex--)
@@ -183,14 +354,11 @@ namespace ChipDataInterface
         }
 
         /// <summary>
-        /// Alınan veriyi gösterecek, kullanıcı tarafından değiştirilemeyen
-        /// RX bitlerini oluşturur.
+        /// 1-byte modunda gelen byte'ın bitlerini gösterecek
+        /// sekiz salt okunur RX bit butonunu oluşturur.
         /// </summary>
         private void CreateRxBitButtons()
         {
-            rxBitsPanel.Controls.Clear();
-            _rxBitButtons.Clear();
-
             for (int bitIndex = PayloadBitCount - 1;
                  bitIndex >= 0;
                  bitIndex--)
@@ -208,24 +376,48 @@ namespace ChipDataInterface
         }
 
         /// <summary>
-        /// Bit butonlarını ekranda görülen sırayla metne dönüştürür.
-        /// Örneğin bit 7-0 değerleri 10101100 biçiminde gösterilir.
+        /// Çoklu-byte modunda UART'a gönderilecek HEX kutularını oluşturur.
+        /// İlk oluşturulan kutu ekranın solunda yer alır ve Byte 0'ı,
+        /// yani ilk gönderilecek byte'ı temsil eder.
         /// </summary>
-        private static string BuildBitString(
-            IReadOnlyList<BitButton> bitButtons)
+        private void CreateTxByteTextBoxes(int byteCount)
         {
-            char[] bitCharacters =
-                new char[bitButtons.Count];
-
-            for (int index = 0;
-                 index < bitButtons.Count;
-                 index++)
+            for (int byteIndex = 0;
+                 byteIndex < byteCount;
+                 byteIndex++)
             {
-                bitCharacters[index] =
-                    bitButtons[index].BitValue ? '1' : '0';
-            }
+                HexByteTextBox byteTextBox = new(
+                    byteIndex,
+                    isReadOnly: false)
+                {
+                    Name = $"txByte{byteIndex}TextBox"
+                };
 
-            return new string(bitCharacters);
+                _txByteTextBoxes.Add(byteTextBox);
+                txBitsPanel.Controls.Add(byteTextBox);
+            }
+        }
+
+        /// <summary>
+        /// Çoklu-byte modunda alınan verileri gösterecek salt okunur HEX
+        /// kutularını oluşturur. İlk alınan byte en soldaki kutuya yazılır.
+        /// </summary>
+        private void CreateRxByteTextBoxes(int byteCount)
+        {
+            for (int byteIndex = 0;
+                 byteIndex < byteCount;
+                 byteIndex++)
+            {
+                HexByteTextBox byteTextBox = new(
+                    byteIndex,
+                    isReadOnly: true)
+                {
+                    Name = $"rxByte{byteIndex}TextBox"
+                };
+
+                _rxByteTextBoxes.Add(byteTextBox);
+                rxBitsPanel.Controls.Add(byteTextBox);
+            }
         }
 
         #endregion
@@ -348,19 +540,27 @@ namespace ChipDataInterface
         }
 
         /// <summary>
-        /// Haberleşme sırasında port, baud rate ve işlem butonlarının
+        /// Haberleşme sırasında bağlantı, baud rate ve payload ayarlarının
         /// değiştirilmesini engeller.
         ///
-        /// Günlük temizleme butonu iletişimden bağımsız olduğu için
-        /// kullanılabilir durumda bırakılır.
+        /// Send ve Read yalnızca geçerli bir payload uzunluğu seçilmişse
+        /// kullanılabilir.
         /// </summary>
         private void SetCommunicationControlsEnabled(bool enabled)
         {
             portComboBox.Enabled = enabled;
             baudRateComboBox.Enabled = enabled;
+            payloadSizeComboBox.Enabled = enabled;
             refreshPortsButton.Enabled = enabled;
-            sendButton.Enabled = enabled;
-            readButton.Enabled = enabled;
+
+            bool payloadSizeIsSelected =
+                SelectedPayloadSize is not null;
+
+            sendButton.Enabled =
+                enabled && payloadSizeIsSelected;
+
+            readButton.Enabled =
+                enabled && payloadSizeIsSelected;
         }
 
         /// <summary>
@@ -383,22 +583,44 @@ namespace ChipDataInterface
         #region TX Operation
 
         /// <summary>
-        /// TX butonlarında seçilen bitleri RAW byte dizisine dönüştürür.
+        /// Seçilen payload moduna göre gönderilecek RAW byte
+        /// dizisini oluşturur.
         ///
-        /// Mevcut 8 bitlik arayüzde sonuç tek byte'tır.
-        /// Örneğin 10101100 seçimi 0xAC byte'ını üretir.
-        ///
-        /// Bit sayısı ileride artırılırsa ilk byte bit 0-7'yi,
-        /// ikinci byte bit 8-15'i içerir.
+        /// 1-byte modunda bit butonları tek byte'a dönüştürülür.
+        /// Çoklu-byte modunda HEX kutuları ekrandaki soldan sağa
+        /// sıraları korunarak RAW byte dizisine aktarılır.
         /// </summary>
         private byte[] BuildTxData()
         {
-            int byteCount =
-                (_txBitButtons.Count + BitsPerByte - 1)
-                / BitsPerByte;
+            PayloadSizeOption payloadSize =
+                SelectedPayloadSize
+                ?? throw new InvalidOperationException(
+                    "Please select a payload size.");
 
-            byte[] txData =
-                new byte[byteCount];
+            if (payloadSize.ByteCount == 1)
+            {
+                return BuildTxDataFromBitButtons();
+            }
+
+            return BuildTxDataFromHexFields(
+                payloadSize.ByteCount);
+        }
+
+        /// <summary>
+        /// Sekiz TX bit butonunu tek RAW byte değerine dönüştürür.
+        ///
+        /// Örnek:
+        /// 10101100 = 0xAC
+        /// </summary>
+        private byte[] BuildTxDataFromBitButtons()
+        {
+            if (_txBitButtons.Count != PayloadBitCount)
+            {
+                throw new InvalidOperationException(
+                    "The 1-byte TX controls are not ready.");
+            }
+
+            byte txByte = 0;
 
             foreach (BitButton bitButton in _txBitButtons)
             {
@@ -407,42 +629,111 @@ namespace ChipDataInterface
                     continue;
                 }
 
-                int byteIndex =
-                    bitButton.BitIndex / BitsPerByte;
+                txByte |=
+                    (byte)(1 << bitButton.BitIndex);
+            }
 
-                int bitPosition =
-                    bitButton.BitIndex % BitsPerByte;
+            return new[] { txByte };
+        }
 
-                txData[byteIndex] |=
-                    (byte)(1 << bitPosition);
+        /// <summary>
+        /// TX HEX kutularındaki değerleri ekranda görülen soldan sağa
+        /// sırayı değiştirmeden RAW byte dizisine dönüştürür.
+        ///
+        /// Örnek ekran:
+        /// A0 00 00 00 00 00 00 0F
+        ///
+        /// SerialPort.Write'a verilen ve hedef UART'ın alacağı byte sırası:
+        /// A0 00 00 00 00 00 00 0F
+        /// </summary>
+        private byte[] BuildTxDataFromHexFields(
+            int expectedByteCount)
+        {
+            if (_txByteTextBoxes.Count != expectedByteCount)
+            {
+                throw new InvalidOperationException(
+                    "The multi-byte TX controls are not ready.");
+            }
+
+            byte[] txData =
+                new byte[expectedByteCount];
+
+            for (int byteIndex = 0;
+                 byteIndex < expectedByteCount;
+                 byteIndex++)
+            {
+                // GetValue, ekrandaki 00-FF değerini gerçek bir byte'a
+                // dönüştürür. String veya ASCII dönüşümü uygulanmaz.
+                txData[byteIndex] =
+                    _txByteTextBoxes[byteIndex].GetValue();
             }
 
             return txData;
         }
 
         /// <summary>
-        /// Gönderilen TX verisini günlükte gösterilecek biçime dönüştürür.
+        /// Byte dizisini sekiz bitlik gruplardan oluşan binary
+        /// gösterime dönüştürür.
+        ///
+        /// Örnek:
+        /// AC-01 = 10101100 00000001
+        /// </summary>
+        private static string BuildBinaryData(
+            IReadOnlyList<byte> data)
+        {
+            string[] binaryBytes =
+                new string[data.Count];
+
+            for (int index = 0;
+                 index < data.Count;
+                 index++)
+            {
+                binaryBytes[index] =
+                    Convert.ToString(data[index], 2)
+                        .PadLeft(BitsPerByte, '0');
+            }
+
+            return string.Join(
+                " ",
+                binaryBytes);
+        }
+
+        /// <summary>
+        /// UART'a gönderilecek TX verisini, ekranda girildiği ve hatta
+        /// yazıldığı ortak sırayla günlük formatına dönüştürür.
         /// </summary>
         private string BuildTxSummary(byte[] txData)
         {
-            string bitData =
-                BuildBitString(_txBitButtons);
+            PayloadSizeOption payloadSize =
+                SelectedPayloadSize
+                ?? throw new InvalidOperationException(
+                    "Please select a payload size.");
+
+            string binaryData =
+                BuildBinaryData(txData);
 
             string hexData =
                 BitConverter.ToString(txData);
 
+            string byteUnit =
+                txData.Length == 1
+                    ? "byte"
+                    : "bytes";
+
             return $"{BuildConnectionSummary()} | " +
-                   $"Bits: {bitData} | " +
-                   $"{txData.Length} byte ({DataFormatName}) | " +
+                   $"{payloadSize.BitCount} bits | " +
+                   $"{txData.Length} {byteUnit} ({DataFormatName}) | " +
+                   $"BIN: {binaryData} | " +
                    $"HEX: {hexData}";
         }
 
         /// <summary>
-        /// TX verisini seçilen UART bağlantısına gönderir.
+        /// Seçilen TX verisini UART bağlantısına RAW byte dizisi
+        /// olarak gönderir.
         ///
-        /// Başarılı işlem yalnızca işlem günlüğüne yazılır.
-        /// Hata veya eksik seçim varsa hem günlüğe yazılır hem
-        /// kullanıcıya açılır pencere gösterilir.
+        /// SerialConnection, verinin bilgisayardaki gönderme tamponundan
+        /// çıkmasını bekler. Ardından cihaz sürekli bağlı bırakılmaması
+        /// için COM portu kapatılır.
         /// </summary>
         private void sendButton_Click(
             object? sender,
@@ -462,21 +753,35 @@ namespace ChipDataInterface
 
                 WriteLog(
                     LogEntryType.Tx,
-                    $"Transmission started | {txSummary}");
+                    "Transmission started" +
+                    Environment.NewLine +
+                    txSummary);
 
                 _serialConnection.Send(txData);
 
-                // Cihaz sürekli iletişimde bırakılmayacağı için gönderim
-                // tamamlanır tamamlanmaz COM portu kapatılır.
                 _serialConnection.Disconnect();
 
                 WriteLog(
                     LogEntryType.Success,
-                    $"TX completed | {txSummary} | " +
+                    $"TX completed | Sent " +
+                    $"{txData.Length}/{txData.Length} bytes" +
+                    Environment.NewLine +
+                    txSummary +
+                    Environment.NewLine +
                     "COM connection closed.");
             }
             catch (InvalidOperationException exception)
             {
+                _serialConnection.Disconnect();
+
+                ReportWarning(
+                    "TX Warning",
+                    exception.Message);
+            }
+            catch (FormatException exception)
+            {
+                // Kullanıcının HEX kutusuna geçersiz bir değer
+                // girmesi sistem hatası değil, giriş uyarısıdır.
                 _serialConnection.Disconnect();
 
                 ReportWarning(
@@ -503,12 +808,11 @@ namespace ChipDataInterface
         #region RX Operation
 
         /// <summary>
-        /// Read butonuna basıldığında COM portunu geçici olarak açar
-        /// ve hedef cihazın göndereceği ilk byte'ı bekler.
+        /// Read düğmesine basıldığında COM portunu geçici olarak açar
+        /// ve seçilen payload uzunluğundaki veriyi bekler.
         ///
-        /// Bu metot hedef cihaza okuma komutu göndermez.
-        /// EEPROM verisini okuyup UART'a gönderme işlemi hedef cihazın
-        /// kendi yazılımı tarafından gerçekleştirilmelidir.
+        /// Bu metot hedef cihaza herhangi bir okuma komutu göndermez.
+        /// Hedef cihazın veriyi kendi UART TX hattından göndermesi gerekir.
         /// </summary>
         private void readButton_Click(
             object? sender,
@@ -521,19 +825,34 @@ namespace ChipDataInterface
 
             SetCommunicationControlsEnabled(false);
 
-            // Port açılır açılmaz byte gelebileceği için bekleme durumu
-            // bağlantı kurulmadan önce etkinleştirilir.
-            _isReadPending = true;
-
             try
             {
+                PayloadSizeOption payloadSize =
+                    SelectedPayloadSize
+                    ?? throw new InvalidOperationException(
+                        "Please select a payload size.");
+
+                // Port açılır açılmaz veri gelebileceği için tampon,
+                // bağlantı kurulmadan önce hazırlanır.
+                _receiveBuffer =
+                    new byte[payloadSize.ByteCount];
+
+                _receivedByteCount = 0;
+                _isReadPending = true;
+
                 EnsureSerialConnection();
+
+                string byteUnit =
+                    payloadSize.ByteCount == 1
+                        ? "byte"
+                        : "bytes";
 
                 WriteLog(
                     LogEntryType.Rx,
                     $"RX listening started | " +
                     $"{BuildConnectionSummary()} | " +
-                    $"Waiting up to {ReadTimeoutMilliseconds} ms.");
+                    $"Waiting for {payloadSize.ByteCount} {byteUnit} | " +
+                    $"Timeout: {ReadTimeoutMilliseconds} ms.");
 
                 _readTimeoutTimer.Start();
             }
@@ -557,7 +876,8 @@ namespace ChipDataInterface
         }
 
         /// <summary>
-        /// Alınan byte'ın her bitini karşılık gelen RX butonunda gösterir.
+        /// Tek byte'lık RX verisinin her bitini karşılık gelen
+        /// salt okunur BitButton üzerinde gösterir.
         /// </summary>
         private void DisplayRxByte(byte receivedByte)
         {
@@ -572,56 +892,147 @@ namespace ChipDataInterface
         }
 
         /// <summary>
-        /// Alınan RX verisini günlükte gösterilecek biçime dönüştürür.
+        /// Tamamlanan RX verisini seçilen payload moduna uygun
+        /// arayüz kontrollerinde gösterir.
+        ///
+        /// UART'tan ilk gelen byte ilk (en soldaki) HEX kutusunda,
+        /// sonraki byte'lar da geliş sıraları korunarak gösterilir.
         /// </summary>
-        private string BuildRxSummary(byte receivedByte)
+        private void DisplayRxData(byte[] receivedData)
         {
-            string bitData =
-                BuildBitString(_rxBitButtons);
+            PayloadSizeOption payloadSize =
+                SelectedPayloadSize
+                ?? throw new InvalidOperationException(
+                    "Please select a payload size.");
+
+            if (receivedData.Length != payloadSize.ByteCount)
+            {
+                throw new InvalidOperationException(
+                    "Received data length does not match " +
+                    "the selected payload size.");
+            }
+
+            if (payloadSize.ByteCount == 1)
+            {
+                // Tek byte'ta byte sırası olmadığı için mevcut
+                // bit gösterim yöntemi doğrudan kullanılabilir.
+                DisplayRxByte(receivedData[0]);
+                return;
+            }
+
+            if (_rxByteTextBoxes.Count != receivedData.Length)
+            {
+                throw new InvalidOperationException(
+                    "The multi-byte RX controls are not ready.");
+            }
+
+            for (int byteIndex = 0;
+                 byteIndex < receivedData.Length;
+                 byteIndex++)
+            {
+                _rxByteTextBoxes[byteIndex].SetValue(
+                    receivedData[byteIndex]);
+            }
+        }
+
+        /// <summary>
+        /// UART'tan alınan RX verisini geliş sırasını değiştirmeden
+        /// günlük formatına dönüştürür.
+        /// </summary>
+        private string BuildRxSummary(byte[] receivedData)
+        {
+            PayloadSizeOption payloadSize =
+                SelectedPayloadSize
+                ?? throw new InvalidOperationException(
+                    "Please select a payload size.");
+
+            string binaryData =
+                BuildBinaryData(receivedData);
+
+            string hexData =
+                BitConverter.ToString(receivedData);
+
+            string byteUnit =
+                receivedData.Length == 1
+                    ? "byte"
+                    : "bytes";
 
             return $"{BuildConnectionSummary()} | " +
-                   $"Bits: {bitData} | " +
-                   $"1 byte ({DataFormatName}) | " +
-                   $"HEX: {receivedByte:X2}";
+                   $"{payloadSize.BitCount} bits | " +
+                   $"{receivedData.Length} {byteUnit} ({DataFormatName}) | " +
+                   $"BIN: {binaryData} | " +
+                   $"HEX: {hexData}";
         }
 
         /// <summary>
         /// SerialPort veri alma olayı arayüz thread'inden farklı bir
-        /// thread üzerinde çalışabileceği için işlem arayüz thread'ine aktarılır.
+        /// thread üzerinde çalıştığı için alınan byte'ın işlenmesini
+        /// Windows Forms arayüz thread'ine aktarır.
         /// </summary>
-        private void SerialConnection_ByteReceived(byte receivedByte)
+        private void SerialConnection_ByteReceived(
+            byte receivedByte)
         {
             PostToUiThread(
                 () => HandleReceivedByte(receivedByte));
         }
 
         /// <summary>
-        /// Read başladıktan sonra alınan ilk byte'ı RX alanında gösterir.
-        /// Daha sonra gelen byte'lar yeni bir Read başlatılana kadar işlenmez.
+        /// UART'tan gelen byte'ları seçilen payload uzunluğuna ulaşıncaya
+        /// kadar sırayla RX tamponunda biriktirir.
+        ///
+        /// Beklenen bütün veri alındığında RX alanı güncellenir,
+        /// işlem günlüğüne sonuç yazılır ve COM bağlantısı kapatılır.
         /// </summary>
         private void HandleReceivedByte(byte receivedByte)
         {
-            if (!_isReadPending)
+            if (!_isReadPending ||
+                _receiveBuffer.Length == 0)
             {
                 return;
             }
 
-            DisplayRxByte(receivedByte);
+            if (_receivedByteCount >=
+                _receiveBuffer.Length)
+            {
+                return;
+            }
+
+            _receiveBuffer[_receivedByteCount] =
+                receivedByte;
+
+            _receivedByteCount++;
+
+            // Beklenen bütün byte'lar henüz alınmadıysa
+            // bağlantı açık tutularak sonraki byte beklenir.
+            if (_receivedByteCount <
+                _receiveBuffer.Length)
+            {
+                return;
+            }
+
+            byte[] completedData =
+                (byte[])_receiveBuffer.Clone();
+
+            DisplayRxData(completedData);
 
             string rxSummary =
-                BuildRxSummary(receivedByte);
+                BuildRxSummary(completedData);
 
             EndReadOperation();
 
             WriteLog(
                 LogEntryType.Success,
-                $"RX completed | {rxSummary} | " +
+                $"RX completed | Received " +
+                $"{completedData.Length}/{completedData.Length} bytes" +
+                Environment.NewLine +
+                rxSummary +
+                Environment.NewLine +
                 "COM connection closed.");
         }
 
         /// <summary>
         /// Arka plandaki RX işlemi sırasında oluşan hatayı
-        /// arayüz thread'ine aktarır.
+        /// Windows Forms arayüz thread'ine aktarır.
         /// </summary>
         private void SerialConnection_ReceiveError(
             Exception exception)
@@ -631,26 +1042,58 @@ namespace ChipDataInterface
         }
 
         /// <summary>
-        /// Aktif Read sırasında oluşan okuma hatasını işler.
+        /// Aktif Read sırasında meydana gelen seri port hatasını
+        /// işler ve alınmış kısmi veri miktarını bildirir.
         /// </summary>
-        private void HandleReceiveError(Exception exception)
+        private void HandleReceiveError(
+            Exception exception)
         {
             if (!_isReadPending)
             {
                 return;
             }
 
+            int expectedByteCount =
+                _receiveBuffer.Length;
+
+            int receivedByteCount =
+                _receivedByteCount;
+
+            string partialHex =
+                BuildPendingRxHex();
+
             EndReadOperation();
 
             ReportError(
                 "RX Error",
                 $"UART read operation failed: " +
-                exception.Message);
+                $"{exception.Message} " +
+                $"Received {receivedByteCount}/" +
+                $"{expectedByteCount} bytes. " +
+                $"Partial HEX: {partialHex}. " +
+                "COM connection closed.");
         }
 
         /// <summary>
-        /// Belirlenen süre içerisinde byte alınmazsa Read işlemini
-        /// sonlandırır ve kullanıcıya uyarı verir.
+        /// Tamponda bulunan fakat henüz tamamlanmamış RX verisini
+        /// HEX biçiminde döndürür.
+        /// </summary>
+        private string BuildPendingRxHex()
+        {
+            if (_receivedByteCount == 0)
+            {
+                return "None";
+            }
+
+            return BitConverter.ToString(
+                _receiveBuffer,
+                startIndex: 0,
+                length: _receivedByteCount);
+        }
+
+        /// <summary>
+        /// Belirlenen süre içerisinde seçilen payload uzunluğu
+        /// tamamlanmazsa Read işlemini sonlandırır.
         /// </summary>
         private void ReadTimeoutTimer_Tick(
             object? sender,
@@ -662,22 +1105,41 @@ namespace ChipDataInterface
                 return;
             }
 
+            int expectedByteCount =
+                _receiveBuffer.Length;
+
+            int receivedByteCount =
+                _receivedByteCount;
+
+            string partialHex =
+                BuildPendingRxHex();
+
             EndReadOperation();
 
             ReportWarning(
                 "RX Timeout",
-                $"{ReadTimeoutMilliseconds} ms without receiving UART data. " +
-                "Reception failed. COM connection closed.");
+                $"UART reception timed out after " +
+                $"{ReadTimeoutMilliseconds} ms. " +
+                $"Received {receivedByteCount}/" +
+                $"{expectedByteCount} bytes. " +
+                $"Partial HEX: {partialHex}. " +
+                "COM connection closed.");
         }
 
         /// <summary>
-        /// Read işlemini sonlandırır, zamanlayıcıyı durdurur,
-        /// COM portunu kapatır ve arayüzü tekrar kullanılabilir yapar.
+        /// Aktif Read işlemini sonlandırır, zamanlayıcıyı durdurur,
+        /// RX tamponunu temizler, COM portunu kapatır ve arayüzü
+        /// tekrar kullanılabilir hâle getirir.
         /// </summary>
         private void EndReadOperation()
         {
             _readTimeoutTimer.Stop();
             _isReadPending = false;
+
+            _receiveBuffer =
+                Array.Empty<byte>();
+
+            _receivedByteCount = 0;
 
             try
             {
@@ -695,7 +1157,8 @@ namespace ChipDataInterface
 
         /// <summary>
         /// İşlem günlüğüne saat, işlem türü ve açıklama ekler.
-        /// Kayıt türleri farklı renklerle gösterilir.
+        /// Birden fazla satır içeren kayıtların devam satırlarını
+        /// ilk mesaj satırıyla aynı hizada gösterir.
         /// </summary>
         private void WriteLog(
             LogEntryType entryType,
@@ -707,29 +1170,47 @@ namespace ChipDataInterface
             }
 
             (string label, Color color) =
-    entryType switch
-    {
-        LogEntryType.Information =>
-            ("INFO", Color.SlateGray),
+                entryType switch
+                {
+                    LogEntryType.Information =>
+                        ("INFO", Color.SlateGray),
 
-        LogEntryType.Tx =>
-            ("TX", Color.RoyalBlue),
+                    LogEntryType.Tx =>
+                        ("TX", Color.RoyalBlue),
 
-        LogEntryType.Rx =>
-            ("RX", Color.DarkCyan),
+                    LogEntryType.Rx =>
+                        ("RX", Color.DarkCyan),
 
-        LogEntryType.Success =>
-            ("SUCCESS", Color.SeaGreen),
+                    LogEntryType.Success =>
+                        ("SUCCESS", Color.SeaGreen),
 
-        LogEntryType.Warning =>
-            ("WARNING", Color.DarkOrange),
+                    LogEntryType.Warning =>
+                        ("WARNING", Color.DarkOrange),
 
-        LogEntryType.Error =>
-            ("ERROR", Color.Firebrick),
+                    LogEntryType.Error =>
+                        ("ERROR", Color.Firebrick),
 
-        _ =>
-            ("INFO", Color.SlateGray)
-    };
+                    _ =>
+                        ("INFO", Color.SlateGray)
+                };
+
+            string timestampText =
+                $"[{DateTime.Now:HH:mm:ss}] ";
+
+            string labelText =
+                $"{label,-10}";
+
+            // Devam satırlarını saat ve kayıt türünün altında değil,
+            // mesajın başladığı sütunda göstermek için boşluk ekler.
+            string continuationIndent =
+                new string(
+                    ' ',
+                    timestampText.Length + labelText.Length);
+
+            string formattedMessage =
+                message.Replace(
+                    Environment.NewLine,
+                    Environment.NewLine + continuationIndent);
 
             activityLogTextBox.SelectionStart =
                 activityLogTextBox.TextLength;
@@ -738,19 +1219,16 @@ namespace ChipDataInterface
             activityLogTextBox.SelectionColor =
                 Color.DimGray;
 
-            activityLogTextBox.AppendText(
-                $"[{DateTime.Now:HH:mm:ss}] ");
+            activityLogTextBox.AppendText(timestampText);
 
             activityLogTextBox.SelectionColor = color;
-
-            activityLogTextBox.AppendText(
-                $"{label,-10}");
+            activityLogTextBox.AppendText(labelText);
 
             activityLogTextBox.SelectionColor =
                 Color.FromArgb(45, 45, 48);
 
             activityLogTextBox.AppendText(
-                $"{message}{Environment.NewLine}");
+                formattedMessage + Environment.NewLine);
 
             activityLogTextBox.SelectionColor =
                 activityLogTextBox.ForeColor;
